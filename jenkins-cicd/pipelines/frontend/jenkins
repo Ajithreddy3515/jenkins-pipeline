@@ -1,0 +1,183 @@
+pipeline {
+    agent any
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout([
+                    $class: 'GitSCM',
+                    branches: [[name: '*/main']],
+                    userRemoteConfigs: [[
+                        url: 'ssh://git@10.50.0.2:2222/pmr_agrimart/frontend/agrimart.git',
+                        credentialsId: 'gitlab-producions'
+                    ]],
+                    extensions: [
+                        [$class: 'SparseCheckoutPaths',
+                            sparseCheckoutPaths: [
+                                [$class: 'SparseCheckoutPath', path: 'admin-page']
+                            ]
+                        ]
+                    ]
+                ])
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('admin-page') {
+                    sh 'npm install --legacy-peer-deps'
+                }
+            }
+        }
+
+        stage('Build Frontend') {
+            steps {
+                dir('admin-page') {
+                    sh 'npm run build'
+                }
+            }
+        }
+
+        stage('Show Build') {
+            steps {
+                dir('admin-page') {
+                    sh 'ls -lh'
+                    sh 'ls -lh dist || true'
+                    sh 'ls -lh build || true'
+                }
+            }
+        }
+
+        stage('Package Frontend') {
+            steps {
+                dir('admin-page') {
+                    sh '''
+                        if [ -d "dist" ]; then
+                            tar -czf admin-page-${BUILD_NUMBER}.tar.gz dist
+                        elif [ -d "build" ]; then
+                            tar -czf admin-page-${BUILD_NUMBER}.tar.gz build
+                        else
+                            echo "ERROR: No dist or build directory found"
+                            exit 1
+                        fi
+                    '''
+                }
+            }
+        }
+
+        stage('Upload Frontend Artifact to Nexus') {
+            steps {
+                dir('admin-page') {
+                    script {
+
+                        def artifactFile = sh(
+                            script: "find . -maxdepth 1 -name 'admin-page-*.tar.gz' | head -1",
+                            returnStdout: true
+                        ).trim()
+
+                        echo "Frontend artifact: ${artifactFile}"
+
+                        nexusArtifactUploader(
+                            nexusVersion: 'nexus3',
+                            protocol: 'http',
+                            nexusUrl: '213.136.79.192:8081',
+                            repository: 'suve-frontend',
+                            credentialsId: 'nexus',
+                            groupId: 'com.nextgenmotor',
+                            artifactId: 'admin-page',
+                            version: "${env.BUILD_NUMBER}",
+                            artifacts: [
+                                [
+                                    artifactId: 'admin-page',
+                                    classifier: '',
+                                    file: artifactFile,
+                                    type: 'tar.gz'
+                                ]
+                            ]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+
+        success {
+            emailext(
+                to: 'ajithreddyoffice@gmail.com',
+                subject: "SUCCESS: Frontend Build - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>Frontend Build Successful</h2>
+
+                    <p><b>Project:</b> admin-page</p>
+                    <p><b>Job:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                    <p><b>Status:</b> SUCCESS</p>
+                    <p><b>Nexus:</b> Frontend artifact uploaded successfully</p>
+
+                    <p>
+                        <b>Nexus Repository:</b>
+                        <a href="http://213.136.79.192:8081/repository/suve-frontend/">
+                            Open suve-frontend
+                        </a>
+                    </p>
+
+                    <p>
+                        <b>Jenkins Build:</b>
+                        <a href="${env.BUILD_URL}">
+                            ${env.BUILD_URL}
+                        </a>
+                    </p>
+                """
+            )
+        }
+
+        failure {
+            emailext(
+                to: 'ajithreddyoffice@gmail.com',
+                subject: "FAILED: Frontend Build - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>Frontend Build Failed</h2>
+
+                    <p><b>Project:</b> admin-page</p>
+                    <p><b>Job:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                    <p><b>Status:</b> FAILURE</p>
+
+                    <p>
+                        <b>Jenkins Build:</b>
+                        <a href="${env.BUILD_URL}">
+                            ${env.BUILD_URL}
+                        </a>
+                    </p>
+
+                    <p>Please check the Jenkins console log for the exact error.</p>
+                """
+            )
+        }
+
+        aborted {
+            emailext(
+                to: 'ajithreddyoffice@gmail.com',
+                subject: "ABORTED: Frontend Build - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                body: """
+                    <h2>Frontend Build Aborted</h2>
+
+                    <p><b>Project:</b> admin-page</p>
+                    <p><b>Job:</b> ${env.JOB_NAME}</p>
+                    <p><b>Build:</b> #${env.BUILD_NUMBER}</p>
+                    <p><b>Status:</b> ABORTED</p>
+
+                    <p>
+                        <b>Jenkins Build:</b>
+                        <a href="${env.BUILD_URL}">
+                            ${env.BUILD_URL}
+                        </a>
+                    </p>
+                """
+            )
+        }
+    }
+}

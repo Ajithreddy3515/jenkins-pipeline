@@ -1,0 +1,1243 @@
+pipeline {
+
+    agent any
+
+    tools {
+        maven 'maven'
+    }
+
+    environment {
+
+        BACKEND_DEPLOY = '/opt/backend-deployment/backend-deploy.sh'
+
+        MOTOR_INCOMING = '/home/logs/backend/211_motor/incoming'
+        ADMIN_INCOMING = '/home/logs/backend/admin/incoming'
+
+        MOTOR_WORKSPACE = '/var/lib/jenkins/workspace/Suve-Backend/Motor_Backend'
+        ADMIN_WORKSPACE = '/var/lib/jenkins/workspace/Suve-Backend/Admin_Backend'
+    }
+
+    stages {
+
+        // ============================================================
+        // CHECKOUT
+        // ============================================================
+
+        stage('Checkout') {
+
+            steps {
+
+                checkout([
+
+                    $class: 'GitSCM',
+
+                    branches: [
+                        [name: '*/main']
+                    ],
+
+                    userRemoteConfigs: [[
+
+                        url: 'ssh://git@10.50.0.2:2222/smart_motor/backend-team/pmr_motor_safety_system.git',
+
+                        credentialsId: 'gitlab-producions'
+
+                    ]],
+
+                    extensions: [
+
+                        [
+
+                            $class: 'SparseCheckoutPaths',
+
+                            sparseCheckoutPaths: [
+
+                                [
+                                    $class: 'SparseCheckoutPath',
+                                    path: 'Motor_Backend'
+                                ],
+
+                                [
+                                    $class: 'SparseCheckoutPath',
+                                    path: 'Admin_Backend'
+                                ]
+
+                            ]
+                        ]
+                    ]
+                ])
+            }
+        }
+
+
+        // ============================================================
+        // DETECT CHANGES
+        // ============================================================
+
+        stage('Detect Changes') {
+
+            steps {
+
+                script {
+
+                    def changes = sh(
+
+                        script: '''
+
+                            if git rev-parse HEAD^ >/dev/null 2>&1; then
+
+                                git diff --name-only HEAD^ HEAD
+
+                            else
+
+                                git diff-tree --no-commit-id --name-only -r HEAD
+
+                            fi
+
+                        ''',
+
+                        returnStdout: true
+
+                    ).trim()
+
+
+                    echo "=========================================="
+                    echo "Changed files:"
+                    echo "=========================================="
+
+                    echo changes
+
+
+                    if (!changes) {
+
+                        env.BUILD_MOTOR = 'false'
+                        env.BUILD_ADMIN = 'false'
+
+                    } else {
+
+                        env.BUILD_MOTOR = changes.split('\\n').any {
+
+                            it.startsWith('Motor_Backend/')
+
+                        }.toString()
+
+
+                        env.BUILD_ADMIN = changes.split('\\n').any {
+
+                            it.startsWith('Admin_Backend/')
+
+                        }.toString()
+
+                    }
+
+
+                    echo "BUILD_MOTOR = ${env.BUILD_MOTOR}"
+                    echo "BUILD_ADMIN = ${env.BUILD_ADMIN}"
+                }
+            }
+        }
+
+
+        // ============================================================
+        // BUILD MOTOR
+        // ============================================================
+
+        stage('Build Motor Backend') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Motor_Backend') {
+
+                    sh '''
+
+                        set -e
+
+                        echo "=========================================="
+                        echo "Building Motor Backend"
+                        echo "=========================================="
+
+
+                        mvn clean package -DskipTests
+
+
+                        echo ""
+                        echo "Motor JAR:"
+
+
+                        find target \
+                            -maxdepth 1 \
+                            -type f \
+                            -name "*.jar"
+
+                    '''
+                }
+            }
+        }
+
+
+        // ============================================================
+        // BUILD ADMIN
+        // ============================================================
+
+        stage('Build Admin Backend') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Admin_Backend') {
+
+                    sh '''
+
+                        set -e
+
+                        echo "=========================================="
+                        echo "Building Admin Backend"
+                        echo "=========================================="
+
+
+                        mvn clean package -DskipTests
+
+
+                        echo ""
+                        echo "Admin JAR:"
+
+
+                        find target \
+                            -maxdepth 1 \
+                            -type f \
+                            -name "*.jar"
+
+                    '''
+                }
+            }
+        }
+
+
+        // ============================================================
+        // UPLOAD MOTOR TO NEXUS
+        // ============================================================
+
+        stage('Upload Motor JAR to Nexus') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Motor_Backend') {
+
+                    script {
+
+                        def jarFile = sh(
+
+                            script: '''
+
+                                find target \
+                                    -maxdepth 1 \
+                                    -type f \
+                                    -name "*.jar" \
+                                    ! -name "*-sources.jar" \
+                                    ! -name "*-javadoc.jar" \
+                                    | head -1
+
+                            ''',
+
+                            returnStdout: true
+
+                        ).trim()
+
+
+                        if (!jarFile) {
+
+                            error('Motor JAR not found')
+
+                        }
+
+
+                        echo "Motor JAR: ${jarFile}"
+
+
+                        nexusArtifactUploader(
+
+                            nexusVersion: 'nexus3',
+
+                            protocol: 'http',
+
+                            nexusUrl: '213.136.79.192:8081',
+
+                            groupId: 'PMR',
+
+                            version: "${env.BUILD_NUMBER}",
+
+                            repository: 'suvebackend',
+
+                            credentialsId: 'nexus',
+
+                            artifacts: [
+
+                                [
+
+                                    artifactId: 'motorsafetysystem',
+
+                                    classifier: '',
+
+                                    file: jarFile,
+
+                                    type: 'jar'
+
+                                ]
+
+                            ]
+                        )
+
+
+                        echo "Motor JAR uploaded to Nexus successfully."
+                    }
+                }
+            }
+        }
+
+
+        // ============================================================
+        // UPLOAD ADMIN TO NEXUS
+        // ============================================================
+
+        stage('Upload Admin JAR to Nexus') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Admin_Backend') {
+
+                    script {
+
+                        def jarFile = sh(
+
+                            script: '''
+
+                                find target \
+                                    -maxdepth 1 \
+                                    -type f \
+                                    -name "*.jar" \
+                                    ! -name "*-sources.jar" \
+                                    ! -name "*-javadoc.jar" \
+                                    | head -1
+
+                            ''',
+
+                            returnStdout: true
+
+                        ).trim()
+
+
+                        if (!jarFile) {
+
+                            error('Admin JAR not found')
+
+                        }
+
+
+                        echo "Admin JAR: ${jarFile}"
+
+
+                        nexusArtifactUploader(
+
+                            nexusVersion: 'nexus3',
+
+                            protocol: 'http',
+
+                            nexusUrl: '213.136.79.192:8081',
+
+                            groupId: 'com.nextgenmotor',
+
+                            version: "${env.BUILD_NUMBER}",
+
+                            repository: 'suvebackend',
+
+                            credentialsId: 'nexus',
+
+                            artifacts: [
+
+                                [
+
+                                    artifactId: 'nextgenmotor-backend',
+
+                                    classifier: '',
+
+                                    file: jarFile,
+
+                                    type: 'jar'
+
+                                ]
+
+                            ]
+                        )
+
+
+                        echo "Admin JAR uploaded to Nexus successfully."
+                    }
+                }
+            }
+        }
+
+
+        // ============================================================
+        // PREPARE MOTOR DEPLOYMENT
+        //
+        // Jenkins ONLY:
+        // 1. Copy JAR
+        // 2. Verify JAR
+        // 3. Create .deploy
+        //
+        // Deployment framework handles cleanup.
+        // ============================================================
+
+        stage('Prepare Motor Deployment') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Motor_Backend') {
+
+                    sh '''
+
+                        set -e
+
+                        echo "=========================================="
+                        echo "Preparing Motor Deployment"
+                        echo "=========================================="
+
+
+                        INCOMING="${MOTOR_INCOMING}"
+
+
+                        # ----------------------------------------------------
+                        # Find JAR
+                        # ----------------------------------------------------
+
+                        JAR_FILE=$(find target \
+                            -maxdepth 1 \
+                            -type f \
+                            -name "*.jar" \
+                            ! -name "*-sources.jar" \
+                            ! -name "*-javadoc.jar" \
+                            | head -1)
+
+
+                        if [ -z "$JAR_FILE" ]; then
+
+                            echo "ERROR: Motor JAR not found"
+
+                            exit 1
+
+                        fi
+
+
+                        echo "JAR selected:"
+                        echo "$JAR_FILE"
+
+
+                        # ----------------------------------------------------
+                        # Jenkins does NOT:
+                        #
+                        # - mkdir
+                        # - delete old files
+                        # - cleanup
+                        #
+                        # Deployment framework handles cleanup.
+                        # ----------------------------------------------------
+
+
+                        # ----------------------------------------------------
+                        # Copy JAR
+                        # ----------------------------------------------------
+
+                        echo ""
+                        echo "Copying Motor JAR to incoming..."
+
+
+                        cp "$JAR_FILE" \
+                           "$INCOMING/211_motor.jar"
+
+
+                        # ----------------------------------------------------
+                        # Verify JAR copy
+                        # ----------------------------------------------------
+
+                        if [ ! -f "$INCOMING/211_motor.jar" ]; then
+
+                            echo "ERROR: Motor JAR copy failed."
+
+                            exit 1
+
+                        fi
+
+
+                        # ----------------------------------------------------
+                        # Verify JAR is not empty
+                        # ----------------------------------------------------
+
+                        if [ ! -s "$INCOMING/211_motor.jar" ]; then
+
+                            echo "ERROR: Motor JAR is empty."
+
+                            exit 1
+
+                        fi
+
+
+                        echo "Motor JAR copied successfully."
+
+
+                        # ----------------------------------------------------
+                        # Create .deploy
+                        # ONLY AFTER successful JAR copy
+                        # ----------------------------------------------------
+
+                        echo ""
+                        echo "Creating deployment marker..."
+
+
+                        touch "$INCOMING/211_motor.deploy"
+
+
+                        # ----------------------------------------------------
+                        # Verify .deploy
+                        # ----------------------------------------------------
+
+                        if [ ! -f "$INCOMING/211_motor.deploy" ]; then
+
+                            echo "ERROR: Failed to create .deploy marker."
+
+                            exit 1
+
+                        fi
+
+
+                        echo ".deploy marker created successfully."
+
+
+                        # ----------------------------------------------------
+                        # Show package
+                        # ----------------------------------------------------
+
+                        echo ""
+                        echo "Motor incoming package:"
+
+
+                        ls -lh "$INCOMING"
+
+
+                        echo ""
+                        echo "Motor deployment package prepared successfully."
+
+                    '''
+                }
+            }
+        }
+
+
+        // ============================================================
+        // MOTOR BLUE-GREEN DEPLOYMENT
+        //
+        // Jenkins runs framework as backenddeploy.
+        //
+        // Framework handles:
+        //
+        // - Backup deployment
+        // - Backup verification
+        // - Incoming cleanup
+        // - Nginx switch
+        // - Primary deployment FROM backup JAR
+        // - Primary verification
+        // - Nginx switch back
+        // - Backup stop
+        // ============================================================
+
+        stage('Deploy Motor Blue-Green') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                sh '''
+
+                    set -e
+
+                    echo "=========================================="
+                    echo "Starting Motor Blue-Green Deployment"
+                    echo "=========================================="
+
+
+                    sudo -u backenddeploy \
+                        "$BACKEND_DEPLOY" \
+                        blue-green \
+                        211_motor
+
+
+                    echo ""
+                    echo "Motor Blue-Green deployment completed."
+
+                '''
+            }
+        }
+
+
+        // ============================================================
+        // PREPARE ADMIN BLUE-GREEN DEPLOYMENT
+        //
+        // Jenkins prepares the artifact only.
+        // The deployment framework performs blue-green deployment.
+        // ============================================================
+
+        stage('Prepare Admin Deployment') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Admin_Backend') {
+
+                    sh '''
+
+                        set -e
+
+                        echo "=========================================="
+                        echo "Preparing Admin Blue-Green Deployment"
+                        echo "=========================================="
+
+                        INCOMING="${ADMIN_INCOMING}"
+
+                        # ----------------------------------------------------
+                        # Find JAR
+                        # ----------------------------------------------------
+
+                        JAR_FILE=$(find target \
+                            -maxdepth 1 \
+                            -type f \
+                            -name "*.jar" \
+                            ! -name "*-sources.jar" \
+                            ! -name "*-javadoc.jar" \
+                            | head -1)
+
+                        if [ -z "$JAR_FILE" ]; then
+                            echo "ERROR: Admin JAR not found"
+                            exit 1
+                        fi
+
+                        echo "JAR selected:"
+                        echo "$JAR_FILE"
+
+                        # ----------------------------------------------------
+                        # Jenkins does NOT:
+                        #
+                        # - mkdir
+                        # - delete old files
+                        # - cleanup
+                        #
+                        # Deployment framework handles cleanup.
+                        # ----------------------------------------------------
+
+                        if [ ! -d "$INCOMING" ]; then
+                            echo "ERROR: Admin incoming directory does not exist:"
+                            echo "$INCOMING"
+                            exit 1
+                        fi
+
+                        # ----------------------------------------------------
+                        # Copy JAR
+                        # ----------------------------------------------------
+
+                        echo ""
+                        echo "Copying Admin JAR to incoming..."
+
+                        cp "$JAR_FILE" \
+                           "$INCOMING/admin.jar"
+
+                        if [ ! -f "$INCOMING/admin.jar" ]; then
+                            echo "ERROR: Admin JAR copy failed."
+                            exit 1
+                        fi
+
+                        if [ ! -s "$INCOMING/admin.jar" ]; then
+                            echo "ERROR: Admin JAR is empty."
+                            exit 1
+                        fi
+
+                        echo "Admin JAR copied successfully."
+
+                        # ----------------------------------------------------
+                        # Create deployment marker
+                        # ----------------------------------------------------
+
+                        echo ""
+                        echo "Creating deployment marker..."
+
+                        touch "$INCOMING/admin.deploy"
+
+                        if [ ! -f "$INCOMING/admin.deploy" ]; then
+                            echo "ERROR: Failed to create .deploy marker."
+                            exit 1
+                        fi
+
+                        echo ".deploy marker created successfully."
+
+                        echo ""
+                        echo "Admin incoming package:"
+                        ls -lh "$INCOMING"
+
+                        echo ""
+                        echo "Admin Blue-Green deployment package prepared successfully."
+
+                    '''
+                }
+            }
+        }
+
+        // ============================================================
+        // ADMIN BLUE-GREEN DEPLOYMENT
+        //
+        // Jenkins runs the existing deployment framework as backenddeploy.
+        // ============================================================
+
+        stage('Deploy Admin Blue-Green') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                sh '''
+
+                    set -e
+
+                    echo "=========================================="
+                    echo "Starting Admin Blue-Green Deployment"
+                    echo "=========================================="
+
+                    sudo -u backenddeploy \
+                        "$BACKEND_DEPLOY" \
+                        blue-green \
+                        211_admin
+
+                    echo ""
+                    echo "Admin Blue-Green deployment completed."
+
+                '''
+            }
+        }
+
+        // ============================================================
+        // VERIFY ADMIN
+        // ============================================================
+
+        stage('Verify Admin') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                sh '''
+
+                    set -e
+
+                    echo "=========================================="
+                    echo "Verifying Admin Blue-Green Deployment"
+                    echo "=========================================="
+
+                    echo ""
+                    echo "Admin primary status:"
+
+                    sudo -n /usr/bin/systemctl \
+                        is-active \
+                        admin.service
+
+                    echo ""
+                    echo "Admin backup status:"
+
+                    sudo -n /usr/bin/systemctl \
+                        is-active \
+                        adminbackup.service || true
+
+                    echo ""
+                    echo "Admin Nginx upstream:"
+
+                    sudo -n /usr/bin/cat \
+                        /etc/nginx/upstreams/admin_backend.conf
+
+                    echo ""
+                    echo "Admin listening ports:"
+
+                    sudo -n /usr/bin/ss -lntp | \
+                        grep -E ':8082|:8084' || true
+
+                    echo ""
+                    echo "Nginx configuration test:"
+
+                    sudo -n /usr/sbin/nginx -t
+
+                    echo ""
+                    echo "Admin incoming directory after deployment:"
+
+                    ls -lah "${ADMIN_INCOMING}"
+
+                    echo ""
+                    echo "Admin Blue-Green verification completed."
+
+                '''
+            }
+        }
+
+        // ============================================================
+        // VERIFY MOTOR
+        // ============================================================
+
+        stage('Verify Motor') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                sh '''
+
+                    set -e
+
+                    echo "=========================================="
+                    echo "Verifying Motor"
+                    echo "=========================================="
+
+
+                    # ----------------------------------------------------
+                    # Primary service
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "211_motor status:"
+
+
+                    sudo -n /usr/bin/systemctl \
+                        is-active \
+                        211_motor.service
+
+
+                    # ----------------------------------------------------
+                    # Backup service
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "211_motor_backup status:"
+
+
+                    sudo -n /usr/bin/systemctl \
+                        is-active \
+                        211_motor_backup.service || true
+
+
+                    # ----------------------------------------------------
+                    # Nginx upstream
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "Nginx upstream:"
+
+
+                    sudo -n /usr/bin/cat \
+                        /etc/nginx/upstreams/motor_backend.conf
+
+
+                    # ----------------------------------------------------
+                    # Listening ports
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "Listening ports:"
+
+
+                    sudo -n /usr/bin/ss -lntp | \
+                        grep -E ':8083|:8086' || true
+
+
+                    # ----------------------------------------------------
+                    # Nginx configuration
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "Nginx configuration test:"
+
+
+                    sudo -n /usr/sbin/nginx -t
+
+
+                    # ----------------------------------------------------
+                    # Incoming directory
+                    # ----------------------------------------------------
+
+                    echo ""
+                    echo "Motor incoming directory after deployment:"
+
+
+                    ls -lah "${MOTOR_INCOMING}"
+
+                '''
+            }
+        }
+
+
+        // ============================================================
+        // SHOW MOTOR JAR
+        // ============================================================
+
+        stage('Show Motor JAR') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_MOTOR == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Motor_Backend') {
+
+                    sh '''
+
+                        echo "Motor build artifacts:"
+
+
+                        ls -lh target/*.jar
+
+                    '''
+                }
+            }
+        }
+
+
+        // ============================================================
+        // SHOW ADMIN JAR
+        // ============================================================
+
+        stage('Show Admin JAR') {
+
+            when {
+
+                expression {
+
+                    env.BUILD_ADMIN == 'true'
+
+                }
+            }
+
+            steps {
+
+                dir('Admin_Backend') {
+
+                    sh '''
+
+                        echo "Admin build artifacts:"
+
+
+                        ls -lh target/*.jar
+
+                    '''
+                }
+            }
+        }
+
+    }
+
+
+    // ================================================================
+    // EMAIL
+    // ================================================================
+
+    post {
+
+        // ============================================================
+        // SUCCESS EMAIL
+        // ============================================================
+
+        success {
+
+            script {
+
+                def builtBackends = []
+
+
+                if (env.BUILD_MOTOR == 'true') {
+
+                    builtBackends.add('Motor_Backend')
+
+                }
+
+
+                if (env.BUILD_ADMIN == 'true') {
+
+                    builtBackends.add('Admin_Backend')
+
+                }
+
+
+                def backendName = builtBackends
+                    ? builtBackends.join(' + ')
+                    : 'No Backend'
+
+
+                emailext(
+
+                    to: 'ajithreddyoffice@gmail.com',
+
+                    subject:
+                        "SUCCESS: ${backendName} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+
+                    body: """
+
+                        <h2>Jenkins Backend Deployment Successful</h2>
+
+                        <p>
+                            <b>Backend:</b>
+                            ${backendName}
+                        </p>
+
+                        <p>
+                            <b>Job:</b>
+                            ${env.JOB_NAME}
+                        </p>
+
+                        <p>
+                            <b>Build:</b>
+                            #${env.BUILD_NUMBER}
+                        </p>
+
+                        <p>
+                            <b>Status:</b>
+                            SUCCESS
+                        </p>
+
+                        <p>
+                            <b>Nexus:</b>
+                            Artifact uploaded successfully
+                        </p>
+
+                        <p>
+                            <b>Deployment:</b>
+                            Completed successfully
+                        </p>
+
+                        <p>
+                            <b>Build URL:</b>
+                            <a href="${env.BUILD_URL}">
+                                ${env.BUILD_URL}
+                            </a>
+                        </p>
+
+                    """
+                )
+            }
+        }
+
+
+        // ============================================================
+        // FAILURE EMAIL
+        // ============================================================
+
+        failure {
+
+            script {
+
+                def failedBackends = []
+
+
+                if (env.BUILD_MOTOR == 'true') {
+
+                    failedBackends.add('Motor_Backend')
+
+                }
+
+
+                if (env.BUILD_ADMIN == 'true') {
+
+                    failedBackends.add('Admin_Backend')
+
+                }
+
+
+                def backendName = failedBackends
+                    ? failedBackends.join(' + ')
+                    : 'Unknown Backend'
+
+
+                emailext(
+
+                    to: 'ajithreddyoffice@gmail.com',
+
+                    subject:
+                        "FAILED: ${backendName} - ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+
+                    body: """
+
+                        <h2>Jenkins Backend Deployment Failed</h2>
+
+                        <p>
+                            <b>Backend:</b>
+                            ${backendName}
+                        </p>
+
+                        <p>
+                            <b>Job:</b>
+                            ${env.JOB_NAME}
+                        </p>
+
+                        <p>
+                            <b>Build:</b>
+                            #${env.BUILD_NUMBER}
+                        </p>
+
+                        <p>
+                            <b>Status:</b>
+                            FAILURE
+                        </p>
+
+                        <p>
+                            The deployment pipeline failed.
+                        </p>
+
+                        <p>
+                            Check Jenkins console output and
+                            server deployment logs.
+                        </p>
+
+                        <p>
+                            <b>Build URL:</b>
+                            <a href="${env.BUILD_URL}">
+                                ${env.BUILD_URL}
+                            </a>
+                        </p>
+
+                    """
+                )
+            }
+        }
+
+
+        // ============================================================
+        // ABORTED EMAIL
+        // ============================================================
+
+        aborted {
+
+            script {
+
+                emailext(
+
+                    to: 'ajithreddyoffice@gmail.com',
+
+                    subject:
+                        "ABORTED: ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+
+                    body: """
+
+                        <h2>Jenkins Backend Deployment Aborted</h2>
+
+                        <p>
+                            <b>Job:</b>
+                            ${env.JOB_NAME}
+                        </p>
+
+                        <p>
+                            <b>Build:</b>
+                            #${env.BUILD_NUMBER}
+                        </p>
+
+                        <p>
+                            <b>Status:</b>
+                            ABORTED
+                        </p>
+
+                        <p>
+                            <b>Build URL:</b>
+                            <a href="${env.BUILD_URL}">
+                                ${env.BUILD_URL}
+                            </a>
+                        </p>
+
+                    """
+                )
+            }
+        }
+    }
+}

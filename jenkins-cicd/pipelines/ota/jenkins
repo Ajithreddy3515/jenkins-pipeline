@@ -1,0 +1,358 @@
+pipeline {
+    agent any
+
+    environment {
+        PROJECT_DIR = '.'
+        FIRMWARE_FILE = 'build/audio_project.bin'
+
+        OTA_FIRMWARE_NAME = 'firmware.bin'
+        OTA_VERSION_NAME = 'version.txt'
+
+        IDF_IMAGE = 'espressif/idf:v5.3.1'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+
+                sh '''
+                    echo "======================================"
+                    echo "Git Commit:"
+                    git rev-parse HEAD
+                    echo "======================================"
+
+                    echo "Project files:"
+                    ls -la
+
+                    echo "======================================"
+                '''
+            }
+        }
+
+        stage('Read OTA Configuration') {
+            steps {
+                script {
+
+                    def otaConfig = readFile('main/ota_config.c')
+
+                    /*
+                     * Extract CURRENT_VERSION
+                     *
+                     * Example:
+                     *
+                     * #define CURRENT_VERSION \\
+                     *     "1.0.19"
+                     */
+
+                    def versionMatcher = otaConfig =~ /#define\s+CURRENT_VERSION\s+\\?\s*\r?\n?\s*"([^"]+)"/
+
+                    if (!versionMatcher.find()) {
+                        error "CURRENT_VERSION not found in main/ota_config.c"
+                    }
+
+                    env.FIRMWARE_VERSION = versionMatcher.group(1).trim()
+
+
+                    /*
+                     * Extract OTA_PATH
+                     *
+                     * Example:
+                     *
+                     * #define OTA_PATH \\
+                     *     "/var/www/html/ota/g111/"
+                     */
+
+                    def pathMatcher = otaConfig =~ /#define\s+OTA_PATH\s+\\?\s*\r?\n?\s*"([^"]+)"/
+
+                    if (!pathMatcher.find()) {
+                        error "OTA_PATH not found in main/ota_config.c"
+                    }
+
+                    env.OTA_REMOTE_PATH = pathMatcher.group(1).trim()
+
+
+                    /*
+                     * Remove trailing slash
+                     *
+                     * /var/www/html/ota/g111/
+                     * becomes
+                     * /var/www/html/ota/g111
+                     */
+
+                    env.OTA_REMOTE_PATH = env.OTA_REMOTE_PATH.replaceAll('/+$', '')
+
+
+                    echo "======================================"
+                    echo "OTA Configuration"
+                    echo "======================================"
+                    echo "Firmware Version : ${env.FIRMWARE_VERSION}"
+                    echo "OTA Remote Path  : ${env.OTA_REMOTE_PATH}"
+                    echo "Firmware File    : ${OTA_FIRMWARE_NAME}"
+                    echo "Version File     : ${OTA_VERSION_NAME}"
+                    echo "======================================"
+                }
+            }
+        }
+
+        stage('Validate OTA Configuration') {
+            steps {
+                script {
+
+                    if (!env.FIRMWARE_VERSION) {
+                        error "Firmware version is empty"
+                    }
+
+                    if (!env.OTA_REMOTE_PATH) {
+                        error "OTA remote path is empty"
+                    }
+
+                    /*
+                     * Make sure OTA_PATH is an absolute Linux path.
+                     */
+
+                    if (!env.OTA_REMOTE_PATH.startsWith('/')) {
+                        error "Invalid OTA_PATH: ${env.OTA_REMOTE_PATH}"
+                    }
+
+                    /*
+                     * Prevent accidental deployment to dangerous locations.
+                     */
+
+                    if (
+                        env.OTA_REMOTE_PATH == '/' ||
+                        env.OTA_REMOTE_PATH == '/var' ||
+                        env.OTA_REMOTE_PATH == '/var/www' ||
+                        env.OTA_REMOTE_PATH == '/var/www/html'
+                    ) {
+                        error "Unsafe OTA deployment path: ${env.OTA_REMOTE_PATH}"
+                    }
+
+                    echo "OTA configuration validation successful."
+                }
+            }
+        }
+
+        stage('Build ESP32 Firmware') {
+            steps {
+                sh '''
+                    echo "======================================"
+                    echo "Building ESP32 firmware"
+                    echo "ESP-IDF: ${IDF_IMAGE}"
+                    echo "======================================"
+
+                    docker run --rm \
+                        --user "$(id -u):$(id -g)" \
+                        -e HOME=/tmp \
+                        -v "$PWD:/project" \
+                        -w /project \
+                        ${IDF_IMAGE} \
+                        idf.py build
+                '''
+            }
+        }
+
+        stage('Verify Firmware') {
+            steps {
+                sh '''
+                    echo "======================================"
+                    echo "Checking firmware"
+                    echo "======================================"
+
+                    if [ ! -f "${FIRMWARE_FILE}" ]; then
+                        echo "ERROR: Firmware not found:"
+                        echo "${FIRMWARE_FILE}"
+                        exit 1
+                    fi
+
+                    ls -lh "${FIRMWARE_FILE}"
+
+                    file "${FIRMWARE_FILE}"
+
+                    echo
+                    echo "Firmware verification successful"
+                '''
+            }
+        }
+
+        stage('Prepare OTA Files') {
+            steps {
+                sh '''
+                    echo "======================================"
+                    echo "Preparing OTA files"
+                    echo "======================================"
+
+                    rm -rf ota-release
+                    mkdir -p ota-release
+
+                    cp "${FIRMWARE_FILE}" \
+                       "ota-release/${OTA_FIRMWARE_NAME}"
+
+                    echo "${FIRMWARE_VERSION}" \
+                       > "ota-release/${OTA_VERSION_NAME}"
+
+                    echo
+                    echo "Files prepared:"
+                    ls -lh ota-release
+
+                    echo
+                    echo "Firmware version:"
+                    cat ota-release/version.txt
+
+                    echo
+                    echo "Deployment path:"
+                    echo "${OTA_REMOTE_PATH}"
+                '''
+            }
+        }
+
+        stage('Deploy to Contabo') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'contabo',
+                        variable: 'CONTABO_HOST'
+                    ),
+                    sshUserPrivateKey(
+                        credentialsId: 'ssh_user',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USERNAME'
+                    )
+                ]) {
+                    sh '''
+                        echo "======================================"
+                        echo "Deploying OTA files"
+                        echo "======================================"
+
+                        echo "Host        : ${CONTABO_HOST}"
+                        echo "User        : ${SSH_USERNAME}"
+                        echo "Remote Path : ${OTA_REMOTE_PATH}"
+                        echo "Version     : ${FIRMWARE_VERSION}"
+
+                        echo
+                        echo "Uploading firmware.bin..."
+
+                        scp \
+                            -i "$SSH_KEY" \
+                            -o IdentitiesOnly=yes \
+                            -o StrictHostKeyChecking=no \
+                            "ota-release/${OTA_FIRMWARE_NAME}" \
+                            "${SSH_USERNAME}@${CONTABO_HOST}:${OTA_REMOTE_PATH}/${OTA_FIRMWARE_NAME}"
+
+                        echo
+                        echo "Uploading version.txt..."
+
+                        scp \
+                            -i "$SSH_KEY" \
+                            -o IdentitiesOnly=yes \
+                            -o StrictHostKeyChecking=no \
+                            "ota-release/${OTA_VERSION_NAME}" \
+                            "${SSH_USERNAME}@${CONTABO_HOST}:${OTA_REMOTE_PATH}/${OTA_VERSION_NAME}"
+
+                        echo
+                        echo "OTA files uploaded successfully."
+                    '''
+                }
+            }
+        }
+
+        stage('Verify OTA Deployment') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'contabo',
+                        variable: 'CONTABO_HOST'
+                    ),
+                    sshUserPrivateKey(
+                        credentialsId: 'ssh_user',
+                        keyFileVariable: 'SSH_KEY',
+                        usernameVariable: 'SSH_USERNAME'
+                    )
+                ]) {
+                    sh '''
+                        echo "======================================"
+                        echo "Verifying OTA deployment"
+                        echo "======================================"
+
+                        echo
+                        echo "Checking firmware.bin..."
+
+                        ssh \
+                            -i "$SSH_KEY" \
+                            -o IdentitiesOnly=yes \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USERNAME@$CONTABO_HOST" \
+                            "ls -lh '${OTA_REMOTE_PATH}/${OTA_FIRMWARE_NAME}'"
+
+                        echo
+                        echo "Checking version.txt..."
+
+                        ssh \
+                            -i "$SSH_KEY" \
+                            -o IdentitiesOnly=yes \
+                            -o StrictHostKeyChecking=no \
+                            "$SSH_USERNAME@$CONTABO_HOST" \
+                            "ls -lh '${OTA_REMOTE_PATH}/${OTA_VERSION_NAME}'"
+
+                        echo
+                        echo "Remote firmware version:"
+
+                        REMOTE_VERSION=$(
+                            ssh \
+                                -i "$SSH_KEY" \
+                                -o IdentitiesOnly=yes \
+                                -o StrictHostKeyChecking=no \
+                                "$SSH_USERNAME@$CONTABO_HOST" \
+                                "cat '${OTA_REMOTE_PATH}/${OTA_VERSION_NAME}'"
+                        )
+
+                        echo "$REMOTE_VERSION"
+
+                        echo
+                        echo "Expected firmware version:"
+                        echo "${FIRMWARE_VERSION}"
+
+                        if [ "$REMOTE_VERSION" != "${FIRMWARE_VERSION}" ]; then
+                            echo
+                            echo "ERROR: Firmware version mismatch!"
+                            echo "Expected: ${FIRMWARE_VERSION}"
+                            echo "Remote:   ${REMOTE_VERSION}"
+                            exit 1
+                        fi
+
+                        echo
+                        echo "Firmware version verified successfully."
+
+                        echo
+                        echo "OTA verification successful."
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+
+        always {
+            sh '''
+                rm -rf ota-release
+            '''
+        }
+
+        success {
+            echo "======================================"
+            echo "OTA PIPELINE SUCCESS"
+            echo "======================================"
+            echo "Firmware Version : ${FIRMWARE_VERSION}"
+            echo "OTA Remote Path  : ${OTA_REMOTE_PATH}"
+            echo "======================================"
+        }
+
+        failure {
+            echo "======================================"
+            echo "OTA PIPELINE FAILED"
+            echo "======================================"
+        }
+    }
+}
